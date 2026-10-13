@@ -62,6 +62,8 @@ class AntennaParams:
     conductor_width: float = 0.6   # 线宽
     conductor_space: float = 0.5   # 线间距
     chamfer: float = 0.0           # 转角 45° 倒角长度，0 = 直角
+    exit_edge: str = "short"       # 出线边: "long"(长边=上下边) | "short"(宽边=左右边)
+    exit_pos: str = "down"         # 出线位置: "up"(上端) | "mid"(中点) | "down"(下端)
     terminal: str = "inner"        # "inner" | "outer"
     via_drill: float = 0.3         # outer 模式过孔钻径
     pad_drill: float = 0.0         # 接线焊盘钻径，0 = SMD
@@ -73,6 +75,10 @@ class AntennaParams:
     def __post_init__(self) -> None:
         if self.terminal not in ("inner", "outer"):
             raise ValueError("terminal 必须是 'inner' 或 'outer'")
+        if self.exit_edge not in ("long", "short"):
+            raise ValueError("exit_edge 必须是 'long' 或 'short'")
+        if self.exit_pos not in ("up", "mid", "down"):
+            raise ValueError("exit_pos 必须是 'up' / 'mid' / 'down'")
 
 
 @dataclass
@@ -111,8 +117,87 @@ class AntennaGeometry:
 # --------------------------------------------------------------------------
 #  螺旋中心线
 # --------------------------------------------------------------------------
+def _next_corner_cw(P: Point, xL: float, xR: float, yT: float, yB: float,
+                    tol: float = 1e-6) -> Tuple[Point, Point]:
+    """顺时针绕行时，从点 P 沿当前边遇到的下一个角点及其前进方向。"""
+    x, y = P
+    on_left = abs(x - xL) <= tol
+    on_right = abs(x - xR) <= tol
+    on_top = abs(y - yT) <= tol
+    on_bottom = abs(y - yB) <= tol
+    if on_left and on_top:
+        return (xR, yT), (1.0, 0.0)
+    if on_right and on_top:
+        return (xR, yB), (0.0, 1.0)
+    if on_right and on_bottom:
+        return (xL, yB), (-1.0, 0.0)
+    if on_left and on_bottom:
+        return (xL, yT), (0.0, -1.0)
+    if on_left:
+        return (xL, yT), (0.0, -1.0)      # 左边向上
+    if on_top:
+        return (xR, yT), (1.0, 0.0)       # 顶边向右
+    if on_right:
+        return (xR, yB), (0.0, 1.0)       # 右边向下
+    if on_bottom:
+        return (xL, yB), (-1.0, 0.0)      # 底边向左
+    # 浮点误差导致不在边上：投影到最近的边再重试
+    dl, dr = abs(x - xL), abs(x - xR)
+    dt, db = abs(y - yT), abs(y - yB)
+    m = min(dl, dr, dt, db)
+    if m == dl:
+        x = xL
+    elif m == dr:
+        x = xR
+    elif m == dt:
+        y = yT
+    else:
+        y = yB
+    return _next_corner_cw((x, y), xL, xR, yT, yB, tol)
+
+
+def _walk_rect_cw(pts: List[Point], start: Point, xL: float, xR: float,
+                  yT: float, yB: float, arc_limit: float) -> Tuple[Point, Point]:
+    """从 start 沿矩形顺时针绕行 arc_limit 长度，把途经角点与终点追加到 pts。
+
+    返回 (终点, 终点处的行进方向)。
+    """
+    P = start
+    traveled = 0.0
+    guard = 0
+    while guard < 64:
+        guard += 1
+        nxt, d = _next_corner_cw(P, xL, xR, yT, yB)
+        seg = math.hypot(nxt[0] - P[0], nxt[1] - P[1])
+        if seg <= EPS:
+            P = nxt
+            continue
+        if traveled + seg >= arc_limit:
+            remain = arc_limit - traveled
+            u = ((nxt[0] - P[0]) / seg, (nxt[1] - P[1]) / seg)
+            end = (P[0] + u[0] * remain, P[1] + u[1] * remain)
+            if math.hypot(end[0] - pts[-1][0], end[1] - pts[-1][1]) > EPS:
+                pts.append(end)
+            return end, u
+        if math.hypot(nxt[0] - pts[-1][0], nxt[1] - pts[-1][1]) > EPS:
+            pts.append(nxt)
+        traveled += seg
+        P = nxt
+    return P, (1.0, 0.0)
+
+
 def spiral_centerline(p: AntennaParams) -> List[Point]:
-    """生成单层矩形螺旋中心线（外端子 → 内端子）。"""
+    """生成单层矩形螺旋中心线（外端子 → 内端子）。
+
+    起点（= 接线焊盘所在位置）由 p.exit_edge / p.exit_pos 决定。
+
+    原理：沿同心矩形 R(k)（每层向内缩一个 pitch）**顺时针**绕行，
+    每层走「周长 − pitch」后垂直向内跨一个 pitch 进入下一层。
+    因为换层的接缝始终落在起点的角向位置，所以无论起点在边的哪个
+    位置，绕向都一致、不会自交。
+
+    坐标：KiCad 封装局部坐标，y 向下。
+    """
     L, W = p.length, p.width
     cW, cS, N = p.conductor_width, p.conductor_space, p.turns
     step = cW + cS
@@ -121,14 +206,26 @@ def spiral_centerline(p: AntennaParams) -> List[Point]:
     def off(k: float) -> float:
         return half + k * step
 
-    pts: List[Point] = [(off(0), W - off(0))]      # 起点：外圈左下
+    t = {"up": 0.0, "mid": 0.5, "down": 1.0}[p.exit_pos]
+    if p.exit_edge == "long":       # 长边 = 底边，x 从左到右
+        start: Point = (off(0) + t * (L - 2 * off(0)), W - off(0))
+    else:                            # 宽边 = 左边，y 从上到下
+        start = (off(0), off(0) + t * (W - 2 * off(0)))
+
+    pts: List[Point] = [start]
+    cur = start
     for k in range(N):
         xL, xR = off(k), L - off(k)
         yT, yB = off(k), W - off(k)
-        pts.append((xL, yT))           # 向上
-        pts.append((xR, yT))           # 向右
-        pts.append((xR, yB))           # 向下
-        pts.append((off(k + 1), yB))   # 向左（向内挪一格）
+        perimeter = 2.0 * ((xR - xL) + (yB - yT))
+        arc = max(perimeter - step, 0.0)
+        cur, d = _walk_rect_cw(pts, cur, xL, xR, yT, yB, arc)
+        if k < N - 1:
+            # 垂直向内跨一个 pitch（顺时针绕行的内向法线）
+            inward = (-d[1], d[0])
+            nxt = (cur[0] + inward[0] * step, cur[1] + inward[1] * step)
+            pts.append(nxt)
+            cur = nxt
     return pts
 
 
@@ -346,8 +443,12 @@ def build(p: AntennaParams) -> AntennaGeometry:
     else:
         # 焊盘需避开丝印框，避免 silk_over_copper
         gap = (margin + p.pad_size + 1.0) if p.silk_margin >= 0 else (p.pad_size + 1.5)
-        pad2_pos = (inner_end[0], W + gap)
-        ret_center = [inner_end, (inner_end[0], pad2_pos[1])]
+        if p.exit_edge == "long":          # 接线在长边（底边）→ 回线向下引出
+            pad2_pos = (inner_end[0], W + gap)
+            ret_center = [inner_end, (inner_end[0], pad2_pos[1])]
+        else:                               # 接线在宽边（左边）→ 回线向左引出
+            pad2_pos = (-gap, inner_end[1])
+            ret_center = [inner_end, (pad2_pos[0], inner_end[1])]
         trace_len += polyline_length(ret_center)
         ret_poly = ribbon_polygon(ret_center, max(cW, p.via_drill + 0.2))
         vias = [inner_end, pad2_pos]
@@ -363,12 +464,18 @@ def build(p: AntennaParams) -> AntennaGeometry:
             ((x0, y1), (x0, y0)),
         ]
 
+    # 铜箔总外接框（含外侧焊盘），用于外框与禁布区
+    xs = [pt[0] for pt in coil_poly] + [t[0] for t in terminals.values()]
+    ys = [pt[1] for pt in coil_poly] + [t[1] for t in terminals.values()]
+    bx0, bx1 = min(xs), max(xs)
+    by0, by1 = min(ys), max(ys)
+
     silk = rect(-margin, -margin, L + margin, W + margin) if p.silk_margin >= 0 else []
     fab = rect(-margin, -margin, L + margin, W + margin)
     cy = max(margin, 0.25) + 0.25
-    courtyard = rect(-cy, -cy, L + cy, W + cy)
-    keepout = rect(-p.keepout_margin, -p.keepout_margin,
-                   L + p.keepout_margin, W + p.keepout_margin) if p.keepout_margin >= 0 else []
+    courtyard = rect(bx0 - cy, by0 - cy, bx1 + cy, by1 + cy)
+    ko = p.keepout_margin
+    keepout = rect(bx0 - ko, by0 - ko, bx1 + ko, by1 + ko) if ko >= 0 else []
 
     return AntennaGeometry(
         params=p,

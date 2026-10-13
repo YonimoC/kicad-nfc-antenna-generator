@@ -29,7 +29,7 @@ except Exception:  # noqa: BLE001 - 被当作顶层模块加载时
     import nfc_geometry as G  # type: ignore
 
 MM = pcbnew.FromMM
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0"
 
 SILK_W = 0.12
 FAB_W = 0.10
@@ -385,6 +385,10 @@ class NfcAntennaDialog(wx.Dialog):
         self.sp_cs = wx.SpinCtrlDouble(self, min=0.1, max=10, inc=0.05, initial=0.5)
         self.sp_ch = wx.SpinCtrlDouble(self, min=0, max=20, inc=0.1, initial=0.0)
         self.sp_ko = wx.SpinCtrlDouble(self, min=0, max=50, inc=0.5, initial=2.0)
+        self.cb_edge = wx.Choice(self, choices=["长边（上/下边）", "宽边（左/右边）"])
+        self.cb_edge.SetSelection(1)
+        self.cb_epos = wx.Choice(self, choices=["上端", "中点（从边中间起绕）", "下端"])
+        self.cb_epos.SetSelection(2)
         self.cb_term = wx.Choice(self, choices=["内侧端子（单层，推荐标签）",
                                                 "外侧双焊盘（B.Cu 过孔跨接，推荐阅读器）"])
         self.cb_term.SetSelection(0)
@@ -423,6 +427,8 @@ class NfcAntennaDialog(wx.Dialog):
         row("线宽 (mm)", self.sp_cw)
         row("线间距 (mm)", self.sp_cs)
         row("转角 45°倒角 (mm)", self.sp_ch)
+        row("出线边", self.cb_edge)
+        row("出线位置", self.cb_epos)
         row("端子方式", self.cb_term)
         row("过孔钻径 (mm)", self.sp_via)
         row("焊盘钻径 (mm, 0=SMD)", self.sp_pdrill)
@@ -474,6 +480,8 @@ class NfcAntennaDialog(wx.Dialog):
             ctrl.Bind(wx.EVT_TEXT, lambda e: self._refresh())
         self.txt_name.Bind(wx.EVT_TEXT, lambda e: self._refresh())
         self.cb_term.Bind(wx.EVT_CHOICE, lambda e: self._refresh())
+        self.cb_edge.Bind(wx.EVT_CHOICE, lambda e: self._refresh())
+        self.cb_epos.Bind(wx.EVT_CHOICE, lambda e: self._refresh())
         self.btn_browse.Bind(wx.EVT_BUTTON, self._on_browse)
         self.btn_save.Bind(wx.EVT_BUTTON, self._on_save)
         self.btn_place.Bind(wx.EVT_BUTTON, self._on_copy)
@@ -488,6 +496,8 @@ class NfcAntennaDialog(wx.Dialog):
             conductor_width=float(self.sp_cw.GetValue()),
             conductor_space=float(self.sp_cs.GetValue()),
             chamfer=float(self.sp_ch.GetValue()),
+            exit_edge="long" if self.cb_edge.GetSelection() == 0 else "short",
+            exit_pos=["up", "mid", "down"][self.cb_epos.GetSelection()],
             terminal="outer" if self.cb_term.GetSelection() == 1 else "inner",
             via_drill=float(self.sp_via.GetValue()),
             pad_drill=float(self.sp_pdrill.GetValue()),
@@ -523,6 +533,8 @@ class NfcAntennaDialog(wx.Dialog):
             f"导体总长 ≈ {e.trace_length_mm:.1f} mm",
             f"趋肤深度 ≈ {e.skin_depth_um:.1f} µm（铜厚 {params.copper_thickness:g} µm）",
             "",
+            f"出线：{'长边' if params.exit_edge == 'long' else '宽边'} · "
+            f"{ {'up': '上端', 'mid': '中点', 'down': '下端'}[params.exit_pos] }",
             f"焊盘：1 @ ({geo.terminals['1'][0]:.2f}, {geo.terminals['1'][1]:.2f})   "
             f"2 @ ({geo.terminals['2'][0]:.2f}, {geo.terminals['2'][1]:.2f})",
         ]
