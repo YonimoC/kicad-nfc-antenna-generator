@@ -11,7 +11,10 @@ NFC Antenna Generator —— KiCad PCB 插件
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
+import time
 
 import wx
 import pcbnew
@@ -26,12 +29,35 @@ except Exception:  # noqa: BLE001 - 被当作顶层模块加载时
     import nfc_geometry as G  # type: ignore
 
 MM = pcbnew.FromMM
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 
 SILK_W = 0.12
 FAB_W = 0.10
 CRTYD_W = 0.05
 KEEPOUT_W = 0.10
+
+
+# ==========================================================================
+#  KiCad 版本兼容层
+# ==========================================================================
+# KiCad 10 起 PAD.SetAnchorPadShape / PAD.AddPrimitivePoly 多了一个前置的
+# 图层参数（KiCad 8/9 没有）。这里靠「先按旧签名调，TypeError 则用新签名」
+# 自适应，比读 docstring 更稳。
+
+def _set_anchor_pad_shape(pad, shape, layer) -> None:
+    """KiCad 8/9: SetAnchorPadShape(shape)；KiCad 10+: (layer, shape)。"""
+    try:
+        pad.SetAnchorPadShape(shape)
+    except TypeError:
+        pad.SetAnchorPadShape(layer, shape)
+
+
+def _add_poly_primitive(pad, pts, layer) -> None:
+    """KiCad 8/9: AddPrimitivePoly(pts, w, filled)；KiCad 10+: (layer, pts, w, filled)。"""
+    try:
+        pad.AddPrimitivePoly(pts, 0, True)
+    except TypeError:
+        pad.AddPrimitivePoly(layer, pts, 0, True)
 
 
 # ==========================================================================
@@ -101,7 +127,7 @@ def _add_return_pad(fp, anchor, polygon, width_mm: float, number: str = "2") -> 
     pad = pcbnew.PAD(fp)
     pad.SetNumber(number)
     pad.SetShape(pcbnew.PAD_SHAPE_CUSTOM)
-    pad.SetAnchorPadShape(pcbnew.PAD_SHAPE_CIRCLE)
+    _set_anchor_pad_shape(pad, pcbnew.PAD_SHAPE_CIRCLE, pcbnew.B_Cu)
     pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
     size = max(width_mm, 0.4)
     pad.SetSize(pcbnew.VECTOR2I(MM(size), MM(size)))
@@ -112,7 +138,7 @@ def _add_return_pad(fp, anchor, polygon, width_mm: float, number: str = "2") -> 
     pad.SetPosition(_vec(anchor[0], anchor[1]))
 
     pts = [pcbnew.VECTOR2I(MM(x - anchor[0]), MM(y - anchor[1])) for (x, y) in polygon]
-    pad.AddPrimitivePoly(pts, 0, True)
+    _add_poly_primitive(pad, pts, pcbnew.B_Cu)
     fp.Add(pad)
 
 
@@ -190,7 +216,7 @@ def default_library_dir() -> str:
 
 
 def next_reference(board, prefix: str = "AE") -> str:
-    """在现有板上找一个未占用的参考号。"""
+    """在现有板上找一个未占用的参考号（备用）。"""
     used = set()
     try:
         for f in board.GetFootprints():
@@ -203,16 +229,62 @@ def next_reference(board, prefix: str = "AE") -> str:
     return f"{prefix}{i}"
 
 
-def _default_pos(board):
-    """默认放置位置：现有对象包围盒中心；空板则用 (50, 50)。"""
+# --------------------------------------------------------------------------
+#  剪贴板：让 KiCad 原生粘贴接管，封装就会跟随鼠标
+# --------------------------------------------------------------------------
+# 依据 KiCad 源码 pcbnew/kicad_clipboard.cpp：PCB 编辑器的剪贴板格式就是
+# **纯文本 wxTextDataObject**，内容是裸的 (footprint ...) s-expression。
+# 所以只要把 .kicad_mod 文本写进系统剪贴板，再按 Ctrl+V，KiCad 就会把它
+# 当成复制/粘贴的对象，自然地跟随鼠标。
+
+def footprint_s_expr(geo: "G.AntennaGeometry") -> str:
+    """把封装导出为 KiCad s-expression 文本（与剪贴板内容一致）。"""
+    fp = build_footprint(geo, None)
+    tmp = tempfile.mkdtemp(prefix="nfc_ant_")
     try:
-        bb = board.ComputeBoundingBox()
-        if bb.GetWidth() > 0 and bb.GetHeight() > 0:
-            c = bb.GetCenter()
-            return pcbnew.ToMM(c.x), pcbnew.ToMM(c.y)
+        lib = os.path.join(tmp, "tmp.pretty")
+        os.makedirs(lib, exist_ok=True)
+        pcbnew.PCB_IO_KICAD_SEXPR().FootprintSave(lib, fp)
+        mods = [n for n in os.listdir(lib) if n.endswith(".kicad_mod")]
+        if not mods:
+            raise RuntimeError("导出封装文本失败")
+        with open(os.path.join(lib, mods[0]), "r", encoding="utf-8") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def verify_s_expr(text: str) -> bool:
+    """用 KiCad 自己的解析器回读，确认文本能当作封装粘贴。"""
+    try:
+        return pcbnew.PCB_IO_KICAD_SEXPR().Parse(text) is not None
     except Exception:  # noqa: BLE001
-        pass
-    return 50.0, 50.0
+        return False
+
+
+def copy_text_to_clipboard(text: str) -> None:
+    """写入系统剪贴板（纯文本，与 KiCad 复制封装时的格式一致）。
+
+    注意：Windows 剪贴板可能被其它进程短暂占用，此时 wx 会产生日志/断言，
+    严重时会 abort 整个进程。KiCad 自己在做剪贴板操作时用 wxLogNull 抑制，
+    这里照做，并加少量重试。
+    """
+    log_null = wx.LogNull()          # 抑制剪贴板被占用时的报错（同 KiCad 源码）
+    try:
+        err = RuntimeError("无法打开系统剪贴板")
+        for _ in range(6):
+            if wx.TheClipboard.Open():
+                try:
+                    wx.TheClipboard.SetData(wx.TextDataObject(text))
+                    # Flush 让数据真正落到系统剪贴板（KiCad 源码同样这么写）
+                    wx.TheClipboard.Flush()
+                finally:
+                    wx.TheClipboard.Close()
+                return
+            time.sleep(0.06)
+        raise err
+    finally:
+        del log_null
 
 
 # ==========================================================================
@@ -303,7 +375,7 @@ class NfcAntennaDialog(wx.Dialog):
         super().__init__(parent, title=f"NFC 天线生成器  v{PLUGIN_VERSION}",
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.board = pcbnew.GetBoard()
-        px, py = _default_pos(self.board)
+        self._copied = False
 
         self.txt_name = wx.TextCtrl(self, value="NFC_ANT")
         self.sp_turns = wx.SpinCtrl(self, min=1, max=40, initial=4)
@@ -321,8 +393,6 @@ class NfcAntennaDialog(wx.Dialog):
         self.sp_psize = wx.SpinCtrlDouble(self, min=0.4, max=10, inc=0.1, initial=1.2)
         self.sp_cu = wx.SpinCtrlDouble(self, min=5, max=210, inc=5, initial=35.0)
         self.sp_silk = wx.SpinCtrlDouble(self, min=-1, max=20, inc=0.5, initial=1.0)
-        self.sp_px = wx.SpinCtrlDouble(self, min=-1000, max=1000, inc=1, initial=round(px, 2))
-        self.sp_py = wx.SpinCtrlDouble(self, min=-1000, max=1000, inc=1, initial=round(py, 2))
         self.txt_lib = wx.TextCtrl(self, value=default_library_dir())
         self.btn_browse = wx.Button(self, label="浏览…")
 
@@ -330,7 +400,7 @@ class NfcAntennaDialog(wx.Dialog):
         self.lbl_info = wx.StaticText(self, label="", size=(380, 150))
         self.lbl_msg = wx.StaticText(self, label="")
         self.btn_save = wx.Button(self, label="生成封装")
-        self.btn_place = wx.Button(self, label="生成并放置")
+        self.btn_place = wx.Button(self, label="生成并复制（去粘贴）")
         self.btn_close = wx.Button(self, id=wx.ID_CANCEL, label="关闭")
 
         self._build_layout()
@@ -360,8 +430,6 @@ class NfcAntennaDialog(wx.Dialog):
         row("铜厚 (µm)", self.sp_cu)
         row("丝印边距 (mm, <0 不画)", self.sp_silk)
         row("禁铺铜外扩 (mm)", self.sp_ko)
-        row("放置 X (mm)", self.sp_px)
-        row("放置 Y (mm)", self.sp_py)
         row("封装库目录", self.txt_lib)
         form.Add(wx.StaticText(self, label=""))
         form.Add(self.btn_browse, 0)
@@ -388,6 +456,10 @@ class NfcAntennaDialog(wx.Dialog):
         root = wx.BoxSizer(wx.VERTICAL)
         root.Add(body, 1, wx.EXPAND | wx.ALL, 10)
         root.Add(self.lbl_msg, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.lbl_hint = wx.StaticText(
+            self,
+            label="提示：点「生成并复制」后回到 PCB 编辑器按 Ctrl+V —— 封装会跟随鼠标，单击左键放下。")
+        root.Add(self.lbl_hint, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(btns, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         self.SetSizerAndFit(root)
         self.SetSize((960, 620))
@@ -404,7 +476,7 @@ class NfcAntennaDialog(wx.Dialog):
         self.cb_term.Bind(wx.EVT_CHOICE, lambda e: self._refresh())
         self.btn_browse.Bind(wx.EVT_BUTTON, self._on_browse)
         self.btn_save.Bind(wx.EVT_BUTTON, self._on_save)
-        self.btn_place.Bind(wx.EVT_BUTTON, self._on_place)
+        self.btn_place.Bind(wx.EVT_BUTTON, self._on_copy)
 
     # ---------------- 参数 ----------------
     def _params(self) -> G.AntennaParams:
@@ -501,26 +573,21 @@ class NfcAntennaDialog(wx.Dialog):
                       "或在封装库表中添加该目录。",
                       "生成完成", wx.OK | wx.ICON_INFORMATION, self)
 
-    def _on_place(self, _evt):
+    def _on_copy(self, _evt):
+        """把封装文本写进系统剪贴板；随后用户按 Ctrl+V，封装会跟随鼠标。"""
         geo = self._refresh()
         if not geo:
             return
-        board = self.board
-        if board is None:
-            self._msg("没有打开的 PCB。", error=True)
-            return
         try:
-            fp = build_footprint(geo, board)
-            board.Add(fp)
-            fp.SetPosition(_vec(self.sp_px.GetValue(), self.sp_py.GetValue()))
-            fp.SetReference(next_reference(board))
-            fp.SetSelected()
-            pcbnew.Refresh()
+            text = footprint_s_expr(geo)
+            if not verify_s_expr(text):
+                raise RuntimeError("导出文本未通过 KiCad 解析自检")
+            copy_text_to_clipboard(text)
         except Exception as exc:  # noqa: BLE001
-            self._msg(f"放置失败：{exc}", error=True)
+            self._msg(f"复制到剪贴板失败：{exc}", error=True)
             return
-        self._msg(f"已放置到 ({self.sp_px.GetValue():g}, {self.sp_py.GetValue():g}) mm；"
-                  "按 M 可移动，按 Delete 可删除。注意：天线下方与四周禁止铺铜。")
+        self._copied = True
+        self.EndModal(wx.ID_OK)
 
 
 # ==========================================================================
@@ -532,7 +599,8 @@ class NfcAntennaGenerator(pcbnew.ActionPlugin):
     def defaults(self):
         self.name = "生成 NFC 天线"
         self.category = "RF / 天线"
-        self.description = "按 NFC 布线规范生成 NFC/HF 天线封装并可一键放置到 PCB"
+        self.description = ("按 NFC 布线规范生成 NFC/HF 天线封装；"
+                            "生成后复制到剪贴板，粘贴时跟随鼠标放置")
         self.show_toolbar_button = True
         self.icon_file_name = os.path.join(_HERE, "icon.png")
 
@@ -543,7 +611,14 @@ class NfcAntennaGenerator(pcbnew.ActionPlugin):
             return
         dlg = NfcAntennaDialog(None)
         dlg.ShowModal()
+        copied = getattr(dlg, "_copied", False)
         dlg.Destroy()
+        if copied:
+            wx.MessageBox(
+                "封装已复制到剪贴板。\n\n"
+                "现在按 Ctrl+V 粘贴 —— 封装会跟着鼠标走，单击左键放下。\n\n"
+                "提示：天线正上/正下与四周禁止铺铜（封装的 Dwgs.User 框已标出）。",
+                "NFC 天线生成器", wx.OK | wx.ICON_INFORMATION)
 
 
 try:
