@@ -1,0 +1,15 @@
+# Build artifacts
+*.zip
+*.pyc
+__pycache__/
+
+# IDE
+.vscode/
+.idea/
+
+# Python
+*.egg-info/
+dist/
+
+# 开发/调试脚本与临时文件
+_dev/
