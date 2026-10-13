@@ -221,9 +221,18 @@ def spiral_centerline(p: AntennaParams) -> List[Point]:
         arc = max(perimeter - step, 0.0)
         cur, d = _walk_rect_cw(pts, cur, xL, xR, yT, yB, arc)
         if k < N - 1:
-            # 垂直向内跨一个 pitch（顺时针绕行的内向法线）
+            # 换层：优先用 45° 斜坡（一个斜段代替两个直角，更平滑、少电流拥挤）；
+            # 起点在角上时斜坡会越界，退回垂直跨步（与标准矩形螺旋一致）。
             inward = (-d[1], d[0])
-            nxt = (cur[0] + inward[0] * step, cur[1] + inward[1] * step)
+            xL1, xR1 = off(k + 1), L - off(k + 1)
+            yT1, yB1 = off(k + 1), W - off(k + 1)
+            diag = (cur[0] + d[0] * step + inward[0] * step,
+                    cur[1] + d[1] * step + inward[1] * step)
+            if (xL1 - 1e-6 <= diag[0] <= xR1 + 1e-6 and
+                    yT1 - 1e-6 <= diag[1] <= yB1 + 1e-6):
+                nxt = diag
+            else:
+                nxt = (cur[0] + inward[0] * step, cur[1] + inward[1] * step)
             pts.append(nxt)
             cur = nxt
     return pts
