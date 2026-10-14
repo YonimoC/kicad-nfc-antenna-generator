@@ -198,26 +198,14 @@ def _walk_rect_cw(pts: Optional[List[Point]], start: Point, xL: float, xR: float
     return P, (1.0, 0.0)
 
 
-def _clamp_step_landing(P: Point, d: Point, xL: float, xR: float, yT: float,
-                        yB: float, step: float) -> Point:
-    """把换层踏步的落点修正到矩形上。
-
-    落点是将「本层走线末端」垂直向里挪一个 pitch 得到的。如果它离前方那段
-    直边的「后方角点」不足一个 pitch，或者干脆跑到矩形外（说明该层对应边
-    已经短到装不下），就把它吸附到那个角点：走线在转角处向内跨层，连接线
-    自然变成斜线——真实螺旋就是这么走的，而且不会把相邻那一匝挤窄。
-    """
-    corners = [(xL, yT), (xR, yT), (xR, yB), (xL, yB)]
-    coords = [c[0] * d[0] + c[1] * d[1] for c in corners]
-    u = P[0] * d[0] + P[1] * d[1]
-    lo, hi = min(coords), max(coords)
-    if u < lo + step - EPS:
-        cand = [c for c, cu in zip(corners, coords) if abs(cu - lo) < EPS]
-        return min(cand, key=lambda c: math.hypot(c[0] - P[0], c[1] - P[1]))
-    if u > hi + EPS:
-        cand = [c for c, cu in zip(corners, coords) if abs(cu - hi) < EPS]
-        return min(cand, key=lambda c: math.hypot(c[0] - P[0], c[1] - P[1]))
-    return P
+def _on_rect(P: Point, xL: float, xR: float, yT: float, yB: float,
+             tol: float = 1e-6) -> bool:
+    x, y = P
+    if (abs(x - xL) < tol or abs(x - xR) < tol) and yT - tol <= y <= yB + tol:
+        return True
+    if (abs(y - yT) < tol or abs(y - yB) < tol) and xL - tol <= x <= xR + tol:
+        return True
+    return False
 
 
 def spiral_centerline(p: AntennaParams, with_sharp: bool = False):
@@ -226,13 +214,12 @@ def spiral_centerline(p: AntennaParams, with_sharp: bool = False):
     起点（= 接线焊盘所在位置）由 p.exit_edge / p.exit_pos 决定。
 
     原理：沿同心矩形 R(k)（每层向内缩一个 pitch）**顺时针**绕行，
-    每层走「周长 − pitch」后垂直向内跨一个 pitch 进入下一层。
+    每层走「周长 − √2×pitch」后以 45° 斜接进入下一层。
     因为换层的接缝始终落在起点的角向位置，所以无论起点在边的哪个
     位置，绕向都一致、不会自交。
 
-    with_sharp=True 时额外返回「换层踏步的顶点索引」——这些角不能倒角，
-    否则那条长度只有一个 pitch 的踏步短边会被切成 45° 斜线，斜线之间的
-    垂距只有 pitch/√2，线距就不等了。
+    with_sharp=True 时额外返回「换层斜接处的顶点索引」——这些角已径是
+    45° 平滑角，不能再切倒角（再切一刀反而会缩小线距）。
 
     坐标：KiCad 封装局部坐标，y 向下。
     """
@@ -257,28 +244,34 @@ def spiral_centerline(p: AntennaParams, with_sharp: bool = False):
         xL, xR = off(k), L - off(k)
         yT, yB = off(k), W - off(k)
         perimeter = 2.0 * ((xR - xL) + (yB - yT))
-        # 接缝（本层走完到下一层起步之间那道缺口）留一个 pitch：
-        # 缺口两端铜箔的间距就正好等于线距。缺口的角点处理见下面换层处。
-        gap = step
+        # 接缝（本层走完到下一层起步之间那道缺口）留 √2×pitch。
+        # 为什么是 √2：换层走的是 45° 斜接，相邻两层那两条斜线是平行的，
+        # 斜线间距 = |沿走线偏移量| / √2。要让斜线间距（从而铜箔净距）
+        # 正好等于 pitch，沿走线方向的偏移就得是 √2×pitch。
+        # 于是换层既平滑（45° 斜角，不用两个直角），线距又严格相等。
+        gap = step * math.sqrt(2.0)
         arc = max(perimeter - gap, 0.0)
-        while gap < perimeter / 2.0:
-            end, ed = _walk_rect_cw(None, cur, xL, xR, yT, yB, arc)
-            if math.hypot(end[0] - cur[0], end[1] - cur[1]) >= step - EPS:
-                break
-            gap += 0.05
-            arc = max(perimeter - gap, 0.0)
         cur, d = _walk_rect_cw(pts, cur, xL, xR, yT, yB, arc)
         if k < N - 1:
-            # 换层：垂直向内跨一个 pitch。
-            # 注：曾试过用 45° 斜坡“更平滑”，但相邻两层的斜坡是平行斜线，
-            # 垂直间距只有 pitch/√2 ≈ 0.707×pitch，会破坏线距；
-            # 数学上只要每层都用 45° 斜坡就无法保持 pitch 间距。
-            # 所以这里坚持垂直跨步，保证各匝线距严格等于 conductor_space。
+            # 45° 斜接：向内一个 pitch，同时沿走线方向前进一个 pitch。
+            # 两个转角都只有 45°（135° 内角，平滑、不会出现锐角）；
+            # 接缝留 √2×pitch 正是为了让相邻两层这两条 45° 斜线的垂距
+            # 仍然等于 pitch（斜线间距 = |pitch + gap − δ|/√2，δ=pitch 时 = pitch）。
+            # 若这样会让落点跑出下一层矩形，就逐步减小前进量（斜得更陡），
+            # 间距只会变大不会变小。
             sharp.add(len(pts) - 1)
             inward = (-d[1], d[0])
-            nxt = _clamp_step_landing(
-                (cur[0] + inward[0] * step, cur[1] + inward[1] * step), d,
-                off(k + 1), L - off(k + 1), off(k + 1), W - off(k + 1), step)
+            xL2, xR2 = off(k + 1), L - off(k + 1)
+            yT2, yB2 = off(k + 1), W - off(k + 1)
+            nxt = None
+            for f in (1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.0):
+                cand = (cur[0] + (inward[0] + d[0] * f) * step,
+                        cur[1] + (inward[1] + d[1] * f) * step)
+                if _on_rect(cand, xL2, xR2, yT2, yB2):
+                    nxt = cand
+                    break
+            if nxt is None:
+                nxt = (cur[0] + inward[0] * step, cur[1] + inward[1] * step)
             if math.hypot(nxt[0] - cur[0], nxt[1] - cur[1]) > EPS:
                 pts.append(nxt)
             sharp.add(len(pts) - 1)
@@ -679,26 +672,20 @@ def build(p: AntennaParams) -> AntennaGeometry:
         pad_sizes["2"] = (w_narrow, len2)
         pad_angles["2"] = ang2
     else:
-        # 外侧焊盘与 pad1 落在同一条「出线位置」上（沿出线边对齐），
-        # 回线从内侧过孔经一个拐点绕到它。
+        # 外侧焊盘就在内侧过孔的正外侧（回线是一根直线，不再拐弯），
+        # 尺寸与 pad1 同形同向，避免出现一大块方焊盘。
         gap = (margin + p.pad_size + 1.0) if p.silk_margin >= 0 else (p.pad_size + 1.5)
         if p.exit_edge == "long":          # 接线在长边（底边）→ 回线向下引出
-            pad2_pos = (pad1_pos[0], W + gap)
-            elbow = (via_inner[0], pad2_pos[1])
+            pad2_pos = (via_inner[0], W + gap)
         else:                               # 接线在宽边（左边）→ 回线向左引出
-            pad2_pos = (-gap, pad1_pos[1])
-            elbow = (pad2_pos[0], via_inner[1])
-        ret_center = [via_inner]
-        for pt in (elbow, pad2_pos):
-            if math.hypot(pt[0] - ret_center[-1][0], pt[1] - ret_center[-1][1]) > EPS:
-                ret_center.append(pt)
+            pad2_pos = (-gap, via_inner[1])
+        ret_center = [via_inner, pad2_pos]
         trace_len += polyline_length(ret_center)
         ret_poly = ribbon_polygon(ret_center, max(cW, p.via_size))
         # 过孔放在线圈内端子处（外侧焊盘本身用通孔，兼作回线另一端的过孔）
         vias = [via_inner]
         via_sizes = [(p.via_size, p.via_size)]
         terminals["2"] = pad2_pos
-        # 外侧焊盘与 pad1 同形同向（避免出现一大块方焊盘），只改成通孔
         pad_sizes["2"] = pad_sizes["1"]
         pad_angles["2"] = pad_angles["1"]
 
