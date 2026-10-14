@@ -30,7 +30,7 @@ except Exception:  # noqa: BLE001 - 被当作顶层模块加载时
     import nfc_geometry as G  # type: ignore
 
 MM = pcbnew.FromMM
-PLUGIN_VERSION = "1.2.2"
+PLUGIN_VERSION = "1.2.3"
 
 SILK_W = 0.12
 FAB_W = 0.10
@@ -569,8 +569,16 @@ class NfcAntennaDialog(wx.Dialog):
             f"尺寸：焊盘 {geo.pad_sizes['1'][0]:g}×{geo.pad_sizes['1'][1]:g} mm"
             "（沿走线方向收窄到线宽，保证与相邻匝间距 = 线距）",
         ]
-        if geo.vias:
+        if params.terminal == "outer":
             lines.append(f"过孔：Ø{params.via_size:g}/{params.via_drill:g} mm")
+        want_long = max(params.pad_size, params.conductor_width)
+        longs = [geo.pad_sizes["1"][1]]
+        if params.terminal == "inner" and "2" in geo.pad_sizes:
+            longs.append(geo.pad_sizes["2"][1])
+        got_long = min(longs)
+        if got_long < want_long - 1e-6:
+            lines.append(f"注：焊盘长边已自动缩短到 {got_long:g} mm"
+                         "（再长会与相邻匝过近）")
         warn = G.warnings(params, e)
         if warn:
             lines.append("")

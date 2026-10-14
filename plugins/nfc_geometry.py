@@ -166,11 +166,11 @@ def _next_corner_cw(P: Point, xL: float, xR: float, yT: float, yB: float,
     return _next_corner_cw((x, y), xL, xR, yT, yB, tol)
 
 
-def _walk_rect_cw(pts: List[Point], start: Point, xL: float, xR: float,
+def _walk_rect_cw(pts: Optional[List[Point]], start: Point, xL: float, xR: float,
                   yT: float, yB: float, arc_limit: float) -> Tuple[Point, Point]:
     """从 start 沿矩形顺时针绕行 arc_limit 长度，把途经角点与终点追加到 pts。
 
-    返回 (终点, 终点处的行进方向)。
+    pts 传 None 则只做仿真、不记录。返回 (终点, 终点处的行进方向)。
     """
     P = start
     traveled = 0.0
@@ -186,17 +186,41 @@ def _walk_rect_cw(pts: List[Point], start: Point, xL: float, xR: float,
             remain = arc_limit - traveled
             u = ((nxt[0] - P[0]) / seg, (nxt[1] - P[1]) / seg)
             end = (P[0] + u[0] * remain, P[1] + u[1] * remain)
-            if math.hypot(end[0] - pts[-1][0], end[1] - pts[-1][1]) > EPS:
+            if pts is not None and math.hypot(end[0] - pts[-1][0],
+                                              end[1] - pts[-1][1]) > EPS:
                 pts.append(end)
             return end, u
-        if math.hypot(nxt[0] - pts[-1][0], nxt[1] - pts[-1][1]) > EPS:
+        if pts is not None and math.hypot(nxt[0] - pts[-1][0],
+                                          nxt[1] - pts[-1][1]) > EPS:
             pts.append(nxt)
         traveled += seg
         P = nxt
     return P, (1.0, 0.0)
 
 
-def spiral_centerline(p: AntennaParams) -> List[Point]:
+def _clamp_step_landing(P: Point, d: Point, xL: float, xR: float, yT: float,
+                        yB: float, step: float) -> Point:
+    """把换层踏步的落点修正到矩形上。
+
+    落点是将「本层走线末端」垂直向里挪一个 pitch 得到的。如果它离前方那段
+    直边的「后方角点」不足一个 pitch，或者干脆跑到矩形外（说明该层对应边
+    已经短到装不下），就把它吸附到那个角点：走线在转角处向内跨层，连接线
+    自然变成斜线——真实螺旋就是这么走的，而且不会把相邻那一匝挤窄。
+    """
+    corners = [(xL, yT), (xR, yT), (xR, yB), (xL, yB)]
+    coords = [c[0] * d[0] + c[1] * d[1] for c in corners]
+    u = P[0] * d[0] + P[1] * d[1]
+    lo, hi = min(coords), max(coords)
+    if u < lo + step - EPS:
+        cand = [c for c, cu in zip(corners, coords) if abs(cu - lo) < EPS]
+        return min(cand, key=lambda c: math.hypot(c[0] - P[0], c[1] - P[1]))
+    if u > hi + EPS:
+        cand = [c for c, cu in zip(corners, coords) if abs(cu - hi) < EPS]
+        return min(cand, key=lambda c: math.hypot(c[0] - P[0], c[1] - P[1]))
+    return P
+
+
+def spiral_centerline(p: AntennaParams, with_sharp: bool = False):
     """生成单层矩形螺旋中心线（外端子 → 内端子）。
 
     起点（= 接线焊盘所在位置）由 p.exit_edge / p.exit_pos 决定。
@@ -205,6 +229,10 @@ def spiral_centerline(p: AntennaParams) -> List[Point]:
     每层走「周长 − pitch」后垂直向内跨一个 pitch 进入下一层。
     因为换层的接缝始终落在起点的角向位置，所以无论起点在边的哪个
     位置，绕向都一致、不会自交。
+
+    with_sharp=True 时额外返回「换层踏步的顶点索引」——这些角不能倒角，
+    否则那条长度只有一个 pitch 的踏步短边会被切成 45° 斜线，斜线之间的
+    垂距只有 pitch/√2，线距就不等了。
 
     坐标：KiCad 封装局部坐标，y 向下。
     """
@@ -223,12 +251,22 @@ def spiral_centerline(p: AntennaParams) -> List[Point]:
         start = (off(0), off(0) + t * (W - 2 * off(0)))
 
     pts: List[Point] = [start]
+    sharp: set = set()
     cur = start
     for k in range(N):
         xL, xR = off(k), L - off(k)
         yT, yB = off(k), W - off(k)
         perimeter = 2.0 * ((xR - xL) + (yB - yT))
-        arc = max(perimeter - step, 0.0)
+        # 接缝（本层走完到下一层起步之间那道缺口）留一个 pitch：
+        # 缺口两端铜箔的间距就正好等于线距。缺口的角点处理见下面换层处。
+        gap = step
+        arc = max(perimeter - gap, 0.0)
+        while gap < perimeter / 2.0:
+            end, ed = _walk_rect_cw(None, cur, xL, xR, yT, yB, arc)
+            if math.hypot(end[0] - cur[0], end[1] - cur[1]) >= step - EPS:
+                break
+            gap += 0.05
+            arc = max(perimeter - gap, 0.0)
         cur, d = _walk_rect_cw(pts, cur, xL, xR, yT, yB, arc)
         if k < N - 1:
             # 换层：垂直向内跨一个 pitch。
@@ -236,11 +274,16 @@ def spiral_centerline(p: AntennaParams) -> List[Point]:
             # 垂直间距只有 pitch/√2 ≈ 0.707×pitch，会破坏线距；
             # 数学上只要每层都用 45° 斜坡就无法保持 pitch 间距。
             # 所以这里坚持垂直跨步，保证各匝线距严格等于 conductor_space。
+            sharp.add(len(pts) - 1)
             inward = (-d[1], d[0])
-            nxt = (cur[0] + inward[0] * step, cur[1] + inward[1] * step)
-            pts.append(nxt)
+            nxt = _clamp_step_landing(
+                (cur[0] + inward[0] * step, cur[1] + inward[1] * step), d,
+                off(k + 1), L - off(k + 1), off(k + 1), W - off(k + 1), step)
+            if math.hypot(nxt[0] - cur[0], nxt[1] - cur[1]) > EPS:
+                pts.append(nxt)
+            sharp.add(len(pts) - 1)
             cur = nxt
-    return pts
+    return (pts, sharp) if with_sharp else pts
 
 
 def _unit(a: Point, b: Point) -> Point:
@@ -263,13 +306,20 @@ def _line_intersect(p: Point, d: Point, q: Point, e: Point) -> Optional[Point]:
     return (p[0] + t * d[0], p[1] + t * d[1])
 
 
-def chamfer_polyline(pts: List[Point], ch: float) -> List[Point]:
-    """把折线的内部转角切成 45° 倒角。"""
+def chamfer_polyline(pts: List[Point], ch: float, sharp=()) -> List[Point]:
+    """把折线的内部转角切成 45° 倒角（去掉重合点，避免零长线段）。
+
+    sharp 里的索引是换层踏步的角，保持直角不切。
+    """
     if ch <= EPS or len(pts) < 3:
         return list(pts)
     out: List[Point] = [pts[0]]
     for i in range(1, len(pts) - 1):
         p_prev, p, p_next = pts[i - 1], pts[i], pts[i + 1]
+        if i in sharp:
+            if math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > EPS:
+                out.append(p)
+            continue
         d_in = _unit(p_prev, p)
         d_out = _unit(p, p_next)
         len_in = math.hypot(p[0] - p_prev[0], p[1] - p_prev[1])
@@ -278,9 +328,13 @@ def chamfer_polyline(pts: List[Point], ch: float) -> List[Point]:
         if c <= EPS:
             out.append(p)
             continue
-        out.append((p[0] - d_in[0] * c, p[1] - d_in[1] * c))
-        out.append((p[0] + d_out[0] * c, p[1] + d_out[1] * c))
-    out.append(pts[-1])
+        for q in ((p[0] - d_in[0] * c, p[1] - d_in[1] * c),
+                  (p[0] + d_out[0] * c, p[1] + d_out[1] * c)):
+            # 相邻转角切点可能重合（短线段两侧都被切完），只保留一个
+            if math.hypot(q[0] - out[-1][0], q[1] - out[-1][1]) > EPS:
+                out.append(q)
+    if math.hypot(pts[-1][0] - out[-1][0], pts[-1][1] - out[-1][1]) > EPS:
+        out.append(pts[-1])
     return out
 
 
@@ -331,6 +385,93 @@ def ribbon_polygon(pts: List[Point], width: float) -> List[Point]:
 def polyline_length(pts: List[Point]) -> float:
     return sum(math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
                for i in range(len(pts) - 1))
+
+
+# --------------------------------------------------------------------------
+#  净距计算（保证线距处处相等的依据）
+# --------------------------------------------------------------------------
+def _pt_seg_dist(p: Point, a: Point, b: Point) -> float:
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    l2 = dx * dx + dy * dy
+    if l2 < 1e-18:
+        return math.hypot(p[0] - ax, p[1] - ay)
+    t = max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / l2))
+    return math.hypot(p[0] - (ax + t * dx), p[1] - (ay + t * dy))
+
+
+def _seg_intersect(a: Point, b: Point, c: Point, d: Point) -> bool:
+    def cr(o, p, q):
+        return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+    d1, d2, d3, d4 = cr(c, d, a), cr(c, d, b), cr(a, b, c), cr(a, b, d)
+    return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+
+def _seg_seg_dist(a: Point, b: Point, c: Point, d: Point) -> float:
+    if _seg_intersect(a, b, c, d):
+        return 0.0
+    return min(_pt_seg_dist(a, c, d), _pt_seg_dist(b, c, d),
+               _pt_seg_dist(c, a, b), _pt_seg_dist(d, a, b))
+
+
+def _stadium_core(cx: float, cy: float, sx: float, sy: float,
+                  rot_deg: float) -> Tuple[Point, Point, float]:
+    """KiCad 的 OVAL 焊盘是「跑道形」= 一段线段按半径 r 膨胀。
+
+    返回 (线段起点, 线段终点, r)；圆焊盘退化为一个点。
+    """
+    r = min(sx, sy) / 2.0
+    half = (max(sx, sy) - min(sx, sy)) / 2.0
+    ax, ay = (1.0, 0.0) if sx >= sy else (0.0, 1.0)
+    ca, sa = math.cos(math.radians(rot_deg)), math.sin(math.radians(rot_deg))
+    dx, dy = ax * ca - ay * sa, ax * sa + ay * ca
+    return ((cx - dx * half, cy - dy * half),
+            (cx + dx * half, cy + dy * half), r)
+
+
+def shape_clearance(segs, cx: float, cy: float, sx: float, sy: float,
+                    rot_deg: float, cW: float, skip=()) -> float:
+    """焊盘/过孔（跑道形）相对一组铜箔带（中心线膨胀 cW/2）的最小净距。"""
+    p, q, r = _stadium_core(cx, cy, sx, sy, rot_deg)
+    best = float("inf")
+    for i, (a, b) in enumerate(segs):
+        if i in skip:
+            continue
+        best = min(best, _seg_seg_dist(p, q, a, b))
+    return best - r - cW / 2.0
+
+
+def polyline_clearance(pts: List[Point], cW: float, skip_adjacent: int = 3) -> float:
+    """折线自身的铜箔净距（跳过相邻段与相接处）。"""
+    segs = list(zip(pts, pts[1:]))
+    best = float("inf")
+    for i in range(len(segs)):
+        for j in range(i + 1, len(segs)):
+            if j - i <= skip_adjacent:
+                continue
+            best = min(best, _seg_seg_dist(segs[i][0], segs[i][1],
+                                           segs[j][0], segs[j][1]))
+    return best - cW
+
+
+def terminal_skip(pts: List[Point], at_end: bool, span: float) -> Tuple[int, ...]:
+    """端子附近「本来就与它连在一起」的段索引：沿路径累加长度不超过 span。
+
+    端子焊盘会与走线末端自然融在一起（同一个导体），所以这一段不能
+    当成「侵占线距」来算。注意 span 很小（焊盘长度量级），不会遮住远端。
+    """
+    segs = list(zip(pts, pts[1:]))
+    idx: List[int] = []
+    acc = 0.0
+    order = range(len(segs) - 1, -1, -1) if at_end else range(len(segs))
+    for i in order:
+        idx.append(i)
+        acc += math.hypot(segs[i][1][0] - segs[i][0][0],
+                          segs[i][1][1] - segs[i][0][1])
+        if acc >= span:
+            break
+    return tuple(idx)
 
 
 # --------------------------------------------------------------------------
@@ -411,8 +552,17 @@ def validate(p: AntennaParams) -> List[str]:
             errs.append("过孔外径必须大于钻径。")
         elif p.via_size - p.via_drill < 0.2:
             errs.append("过孔环宽 < 0.1 mm，多数板厂工艺做不到。")
-        if p.pad_size < p.via_drill + 0.2:
-            errs.append(f"外侧焊盘 {p.pad_size:g} mm 放不下 Ø{p.via_drill:g} 的孔。")
+        w_narrow = min(p.pad_size, p.conductor_width)
+        if w_narrow < p.via_drill + 0.2 - EPS:
+            errs.append(
+                f"外侧焊盘沿走线方向只有 {w_narrow:g} mm（= min(焊盘尺寸, 线宽)），"
+                f"放不下 Ø{p.via_drill:g} 的过孔（环宽需 ≥ 0.1 mm）。\n"
+                "请减小过孔钻径或加大线宽。")
+        if p.via_size > p.conductor_width + EPS:
+            errs.append(
+                f"过孔外径 {p.via_size:g} mm 大于线宽 {p.conductor_width:g} mm，"
+                f"放不进 {p.conductor_width + p.conductor_space:g} mm 的节距。"
+                "请减小过孔外径、加大线宽或加大线间距。")
 
     step = p.conductor_width + p.conductor_space
     need_l = p.conductor_width + (2 * p.turns - 1) * step
@@ -462,9 +612,9 @@ def build(p: AntennaParams) -> AntennaGeometry:
     step = cW + cS
     margin = p.silk_margin if p.silk_margin > 0 else 0.0
 
-    centerline = spiral_centerline(p)
+    centerline, sharp = spiral_centerline(p, with_sharp=True)
     if p.chamfer > 0:
-        centerline = chamfer_polyline(centerline, p.chamfer)
+        centerline = chamfer_polyline(centerline, p.chamfer, sharp)
 
     coil_poly = ribbon_polygon(centerline, cW)
     trace_len = polyline_length(centerline)
@@ -473,10 +623,9 @@ def build(p: AntennaParams) -> AntennaGeometry:
 
     # 焊盘尺寸：沿「走线方向」窄（≤ 线宽），沿「法线方向」长。
     # 这样焊盘不会侵占与相邻那一匝的间距（保持 = conductor_space），
-    # 同时向外侧自由空间伸长以保证可焊接面积。
+    # 同时向自由侧伸长以保证可焊接面积。
     w_long = max(p.pad_size, cW)
     w_narrow = min(p.pad_size, cW)
-    off = w_long / 2.0 - cW / 2.0
 
     # 起点（外端子）朝外方向：行进方向的“外向法线”
     d0 = _unit(coil_start, centerline[1])
@@ -487,20 +636,36 @@ def build(p: AntennaParams) -> AntennaGeometry:
     to_center = (center_pt[0] - coil_end[0], center_pt[1] - coil_end[1])
     in2 = max(fans, key=lambda v: v[0] * to_center[0] + v[1] * to_center[1])
 
-    # 焊盘中心：沿法线外移，使焊盘近边正好落在端子铜箔的远边上
-    pad1_pos = (coil_start[0] + out1[0] * off, coil_start[1] + out1[1] * off)
-    pad2_inner = (coil_end[0] + in2[0] * off, coil_end[1] + in2[1] * off)
+    # 焊盘局部 X 轴沿走线方向，于是尺寸 = (窄, 长)
+    ang1 = math.degrees(math.atan2(d0[1], d0[0]))
+    ang2 = math.degrees(math.atan2(dN[1], dN[0]))
+
+    segs = list(zip(centerline, centerline[1:]))
+    n_seg = len(segs)
+
+    def place(near_pt: Point, nrm: Point, ang: float,
+              connected: Tuple[int, ...]) -> Tuple[float, Point]:
+        """把椭圆焊盘沿法线伸出：近边落在端子铜箔远边，长边尽量长，
+        若伸出去会侵占线距则自动缩短（最短退化为圆）。
+        """
+        length = w_long
+        while True:
+            off_try = length / 2.0 - cW / 2.0
+            pos = (near_pt[0] + nrm[0] * off_try, near_pt[1] + nrm[1] * off_try)
+            gap = shape_clearance(segs, pos[0], pos[1], w_narrow, length,
+                                  ang, cW, connected)
+            if gap >= cS - EPS or length <= w_narrow + EPS:
+                return length, pos
+            length = max(length - 0.05, w_narrow)
+
+    len1, pad1_pos = place(coil_start, out1, ang1,
+                           terminal_skip(centerline, False, w_long + cW))
     # 过孔外径 ≤ 线宽时中心正好落在走线端点上
     off_via = max(p.via_size / 2.0 - cW / 2.0, 0.0)
     via_inner = (coil_end[0] + in2[0] * off_via, coil_end[1] + in2[1] * off_via)
 
-    # 焊盘局部 X 轴沿走线方向，于是尺寸 = (窄, 长)
-    ang1 = math.degrees(math.atan2(d0[1], d0[0]))
-    ang2 = math.degrees(math.atan2(dN[1], dN[0]))
-    base_size = (w_narrow, w_long)
-
     terminals: Dict[str, Point] = {"1": pad1_pos}
-    pad_sizes: Dict[str, Tuple[float, float]] = {"1": base_size}
+    pad_sizes: Dict[str, Tuple[float, float]] = {"1": (w_narrow, len1)}
     pad_angles: Dict[str, float] = {"1": ang1}
     ret_poly: List[Point] = []
     ret_center: List[Point] = []
@@ -508,27 +673,60 @@ def build(p: AntennaParams) -> AntennaGeometry:
     via_sizes: List[Tuple[float, float]] = []
 
     if p.terminal == "inner":
-        terminals["2"] = pad2_inner
-        pad_sizes["2"] = base_size
+        len2, pad2_pos = place(coil_end, in2, ang2,
+                               terminal_skip(centerline, True, w_long + cW))
+        terminals["2"] = pad2_pos
+        pad_sizes["2"] = (w_narrow, len2)
         pad_angles["2"] = ang2
     else:
-        # 焊盘需避开丝印框，避免 silk_over_copper
+        # 外侧焊盘与 pad1 落在同一条「出线位置」上（沿出线边对齐），
+        # 回线从内侧过孔经一个拐点绕到它。
         gap = (margin + p.pad_size + 1.0) if p.silk_margin >= 0 else (p.pad_size + 1.5)
         if p.exit_edge == "long":          # 接线在长边（底边）→ 回线向下引出
-            pad2_pos = (pad2_inner[0], W + gap)
-            ret_center = [pad2_inner, (pad2_inner[0], pad2_pos[1])]
+            pad2_pos = (pad1_pos[0], W + gap)
+            elbow = (via_inner[0], pad2_pos[1])
         else:                               # 接线在宽边（左边）→ 回线向左引出
-            pad2_pos = (-gap, pad2_inner[1])
-            ret_center = [pad2_inner, (pad2_pos[0], pad2_inner[1])]
+            pad2_pos = (-gap, pad1_pos[1])
+            elbow = (pad2_pos[0], via_inner[1])
+        ret_center = [via_inner]
+        for pt in (elbow, pad2_pos):
+            if math.hypot(pt[0] - ret_center[-1][0], pt[1] - ret_center[-1][1]) > EPS:
+                ret_center.append(pt)
         trace_len += polyline_length(ret_center)
         ret_poly = ribbon_polygon(ret_center, max(cW, p.via_size))
         # 过孔放在线圈内端子处（外侧焊盘本身用通孔，兼作回线另一端的过孔）
         vias = [via_inner]
         via_sizes = [(p.via_size, p.via_size)]
         terminals["2"] = pad2_pos
-        # 外侧焊盘远离线圈，不受线距约束，用完整尺寸便于焊接
-        pad_sizes["2"] = (p.pad_size, p.pad_size)
-        pad_angles["2"] = 0.0
+        # 外侧焊盘与 pad1 同形同向（避免出现一大块方焊盘），只改成通孔
+        pad_sizes["2"] = pad_sizes["1"]
+        pad_angles["2"] = pad_angles["1"]
+
+    # ---- 几何自检：所有铜箔之间必须保持 ≥ 线间距 ----
+    audit = [polyline_clearance(centerline, cW)]
+    tail_skip = terminal_skip(centerline, True, w_long + cW)
+    head_skip = terminal_skip(centerline, False, w_long + cW)
+    for name, pos in terminals.items():
+        if p.terminal == "outer" and name == "2":
+            skip: Tuple[int, ...] = ()
+        else:
+            skip = head_skip if name == "1" else tail_skip
+        sx, sy = pad_sizes[name]
+        audit.append(shape_clearance(segs, pos[0], pos[1], sx, sy,
+                                     pad_angles[name], cW, skip))
+    for (vx, vy) in vias:
+        audit.append(shape_clearance(segs, vx, vy, p.via_size, p.via_size,
+                                     0.0, cW, tail_skip))
+    worst = min(audit)
+    if worst < cS - 1e-6:
+        raise ValueError(
+            f"几何自检未通过：最小净距 {worst:.3f} mm，小于设定的线间距 {cS:g} mm。\n"
+            "原因是「换层接缝」在这组尺寸里放不下：每绕一层，接缝会沿走线方向\n"
+            f"后移 2×({cW:g}+{cS:g})={2 * (cW + cS):g} mm，"
+            f"{N} 匝共需约 {(2 * N - 1) * (cW + cS):g} mm 的直线段，\n"
+            "而出线位置到该边端点的距离不够。\n"
+            "可尝试：加大线间距、减少匝数、把出线位置改到靠边（上端/下端），"
+            "或加长天线尺寸。")
 
     est = estimate(p, trace_len)
 
