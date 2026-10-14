@@ -1,8 +1,11 @@
 # NFC Antenna Generator —— KiCad NFC 天线生成器
 
-> 版本 **1.2.4** · 兼容 **KiCad 8.0 ~ 11**（SWIG Action Plugin）
+> 版本 **1.0.0** · 兼容 **KiCad 8.0 ~ 11**（SWIG Action Plugin）
 >
 > 已在 **KiCad 8.0.9** 与 **KiCad 10.0.1** 上实测：构建、保存、DRC 均通过。
+>
+> 开发过程中的迭代版本（几何算法打磨阶段）统一算作 **v0.x 预发布**，
+> 从 **v1.0.0** 起接口/几何行为稳定。
 
 在 PCB 编辑器里输入参数，**一键生成符合 NFC 布线规范的 13.56 MHz 天线封装**，
 并可**一键放置**到当前 PCB。

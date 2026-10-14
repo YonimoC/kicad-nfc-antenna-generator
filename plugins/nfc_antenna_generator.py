@@ -30,7 +30,7 @@ except Exception:  # noqa: BLE001 - 被当作顶层模块加载时
     import nfc_geometry as G  # type: ignore
 
 MM = pcbnew.FromMM
-PLUGIN_VERSION = "1.2.4"
+PLUGIN_VERSION = "1.0.0"
 
 SILK_W = 0.12
 FAB_W = 0.10
