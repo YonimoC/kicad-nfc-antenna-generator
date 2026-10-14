@@ -65,6 +65,7 @@ class AntennaParams:
     exit_edge: str = "short"       # 出线边: "long"(长边=上下边) | "short"(宽边=左右边)
     exit_pos: str = "down"         # 出线位置: "up"(上端) | "mid"(中点) | "down"(下端)
     terminal: str = "inner"        # "inner" | "outer"
+    via_size: float = 0.6          # outer 模式过孔外径（需 ≤ 线宽才不会侵占线距）
     via_drill: float = 0.3         # outer 模式过孔钻径
     pad_drill: float = 0.0         # 接线焊盘钻径，0 = SMD
     pad_size: float = 1.2          # 接线焊盘直径
@@ -100,10 +101,19 @@ class Estimate:
 class AntennaGeometry:
     params: AntennaParams
     coil_polygon: List[Point]                       # F.Cu 天线铜箔多边形
-    terminals: Dict[str, Point]                     # "1"/"2" -> 位置
+    centerline: List[Point] = field(default_factory=list)  # 螺旋中心线
+    terminals: Dict[str, Point] = field(default_factory=dict)  # "1"/"2" -> 位置
     return_polygon: List[Point] = field(default_factory=list)   # B.Cu 回线
     return_centerline: List[Point] = field(default_factory=list)  # 回线中心线（自定义焊盘用）
     vias: List[Point] = field(default_factory=list) # 过孔位置（outer）
+    # 每个焊盘的 (x尺寸, y尺寸)：沿出线边方向被压到 ≤ 线宽，
+    # 这样它与相邻那一匝的间距正好还是 conductor_space；垂直方向加长以保证可焊接。
+    pad_sizes: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    pad_angles: Dict[str, float] = field(default_factory=dict)   # 焊盘旋转角(度)
+    via_sizes: List[Tuple[float, float]] = field(default_factory=list)
+    via_inner: Point = (0.0, 0.0)                   # 内端子过孔位置（outer）
+    coil_start: Point = (0.0, 0.0)
+    coil_end: Point = (0.0, 0.0)
     silk: List[Tuple[Point, Point]] = field(default_factory=list)
     fab: List[Tuple[Point, Point]] = field(default_factory=list)
     courtyard: List[Tuple[Point, Point]] = field(default_factory=list)
@@ -221,18 +231,13 @@ def spiral_centerline(p: AntennaParams) -> List[Point]:
         arc = max(perimeter - step, 0.0)
         cur, d = _walk_rect_cw(pts, cur, xL, xR, yT, yB, arc)
         if k < N - 1:
-            # 换层：优先用 45° 斜坡（一个斜段代替两个直角，更平滑、少电流拥挤）；
-            # 起点在角上时斜坡会越界，退回垂直跨步（与标准矩形螺旋一致）。
+            # 换层：垂直向内跨一个 pitch。
+            # 注：曾试过用 45° 斜坡“更平滑”，但相邻两层的斜坡是平行斜线，
+            # 垂直间距只有 pitch/√2 ≈ 0.707×pitch，会破坏线距；
+            # 数学上只要每层都用 45° 斜坡就无法保持 pitch 间距。
+            # 所以这里坚持垂直跨步，保证各匝线距严格等于 conductor_space。
             inward = (-d[1], d[0])
-            xL1, xR1 = off(k + 1), L - off(k + 1)
-            yT1, yB1 = off(k + 1), W - off(k + 1)
-            diag = (cur[0] + d[0] * step + inward[0] * step,
-                    cur[1] + d[1] * step + inward[1] * step)
-            if (xL1 - 1e-6 <= diag[0] <= xR1 + 1e-6 and
-                    yT1 - 1e-6 <= diag[1] <= yB1 + 1e-6):
-                nxt = diag
-            else:
-                nxt = (cur[0] + inward[0] * step, cur[1] + inward[1] * step)
+            nxt = (cur[0] + inward[0] * step, cur[1] + inward[1] * step)
             pts.append(nxt)
             cur = nxt
     return pts
@@ -386,12 +391,28 @@ def validate(p: AntennaParams) -> List[str]:
         errs.append("铜厚必须 > 0 µm。")
     if p.pad_drill and p.pad_drill >= p.pad_size:
         errs.append("焊盘钻孔必须小于焊盘直径。")
+    # 为保证与相邻那一匝的线距，焊盘沿走线方向只能到 min(焊盘尺寸, 线宽)
+    if p.pad_drill and min(p.pad_size, p.conductor_width) < p.pad_drill + 0.2 - EPS:
+        errs.append(
+            f"焊盘钻孔 Ø{p.pad_drill:g} 放不下：焊盘沿走线方向最多"
+            f" {min(p.pad_size, p.conductor_width):g} mm"
+            "（= min(焊盘尺寸, 线宽)，这样才不会侵占相邻匝的间距），"
+            "环宽需 ≥ 0.1 mm。请减小钻孔或加大线宽。")
     if p.chamfer < 0:
         errs.append("倒角不能为负。")
     if p.chamfer > p.conductor_width + p.conductor_space + EPS:
         errs.append("倒角过大（不应超过「线宽 + 线距」）。")
     if p.terminal == "outer" and p.via_drill <= 0:
         errs.append("outer 模式下过孔钻径必须 > 0。")
+    if p.pad_size <= 0:
+        errs.append("焊盘尺寸必须 > 0。")
+    if p.terminal == "outer":
+        if p.via_size <= p.via_drill:
+            errs.append("过孔外径必须大于钻径。")
+        elif p.via_size - p.via_drill < 0.2:
+            errs.append("过孔环宽 < 0.1 mm，多数板厂工艺做不到。")
+        if p.pad_size < p.via_drill + 0.2:
+            errs.append(f"外侧焊盘 {p.pad_size:g} mm 放不下 Ø{p.via_drill:g} 的孔。")
 
     step = p.conductor_width + p.conductor_space
     need_l = p.conductor_width + (2 * p.turns - 1) * step
@@ -417,6 +438,13 @@ def warnings(p: AntennaParams, est: Estimate) -> List[str]:
         msgs.append("线宽 < 0.3 mm，直流电阻与损耗偏大。")
     if max(p.length, p.width) > 1.5 * min(p.length, p.width):
         msgs.append("长宽比偏大，磁场分布会不对称。")
+    if p.pad_size > p.conductor_width + EPS:
+        msgs.append(f"焊盘沿出线边方向已自动收窄到线宽 {p.conductor_width:g} mm"
+                    f"（实际 {p.conductor_width:g}×{p.pad_size:g} mm 椭圆），"
+                    "以保证与相邻一匝的间距仍等于线距。")
+    if p.terminal == "outer" and p.via_size > p.conductor_width + EPS:
+        msgs.append(f"过孔外径 {p.via_size:g} mm 大于线宽 {p.conductor_width:g} mm，"
+                    "与相邻一匝的间距会被压缩；建议过孔外径 ≤ 线宽。")
     return msgs
 
 
@@ -440,28 +468,67 @@ def build(p: AntennaParams) -> AntennaGeometry:
 
     coil_poly = ribbon_polygon(centerline, cW)
     trace_len = polyline_length(centerline)
+    coil_start, coil_end = centerline[0], centerline[-1]
+    center_pt = (L / 2.0, W / 2.0)
 
-    terminals: Dict[str, Point] = {"1": centerline[0]}
+    # 焊盘尺寸：沿「走线方向」窄（≤ 线宽），沿「法线方向」长。
+    # 这样焊盘不会侵占与相邻那一匝的间距（保持 = conductor_space），
+    # 同时向外侧自由空间伸长以保证可焊接面积。
+    w_long = max(p.pad_size, cW)
+    w_narrow = min(p.pad_size, cW)
+    off = w_long / 2.0 - cW / 2.0
+
+    # 起点（外端子）朝外方向：行进方向的“外向法线”
+    d0 = _unit(coil_start, centerline[1])
+    out1 = (d0[1], -d0[0])
+    # 内端子朝线圈中心方向（在两条法线里选指向中心的那条）
+    dN = _unit(centerline[-2], coil_end)
+    fans = ((-dN[1], dN[0]), (dN[1], -dN[0]))
+    to_center = (center_pt[0] - coil_end[0], center_pt[1] - coil_end[1])
+    in2 = max(fans, key=lambda v: v[0] * to_center[0] + v[1] * to_center[1])
+
+    # 焊盘中心：沿法线外移，使焊盘近边正好落在端子铜箔的远边上
+    pad1_pos = (coil_start[0] + out1[0] * off, coil_start[1] + out1[1] * off)
+    pad2_inner = (coil_end[0] + in2[0] * off, coil_end[1] + in2[1] * off)
+    # 过孔外径 ≤ 线宽时中心正好落在走线端点上
+    off_via = max(p.via_size / 2.0 - cW / 2.0, 0.0)
+    via_inner = (coil_end[0] + in2[0] * off_via, coil_end[1] + in2[1] * off_via)
+
+    # 焊盘局部 X 轴沿走线方向，于是尺寸 = (窄, 长)
+    ang1 = math.degrees(math.atan2(d0[1], d0[0]))
+    ang2 = math.degrees(math.atan2(dN[1], dN[0]))
+    base_size = (w_narrow, w_long)
+
+    terminals: Dict[str, Point] = {"1": pad1_pos}
+    pad_sizes: Dict[str, Tuple[float, float]] = {"1": base_size}
+    pad_angles: Dict[str, float] = {"1": ang1}
     ret_poly: List[Point] = []
     ret_center: List[Point] = []
     vias: List[Point] = []
+    via_sizes: List[Tuple[float, float]] = []
 
-    inner_end = centerline[-1]
     if p.terminal == "inner":
-        terminals["2"] = inner_end
+        terminals["2"] = pad2_inner
+        pad_sizes["2"] = base_size
+        pad_angles["2"] = ang2
     else:
         # 焊盘需避开丝印框，避免 silk_over_copper
         gap = (margin + p.pad_size + 1.0) if p.silk_margin >= 0 else (p.pad_size + 1.5)
         if p.exit_edge == "long":          # 接线在长边（底边）→ 回线向下引出
-            pad2_pos = (inner_end[0], W + gap)
-            ret_center = [inner_end, (inner_end[0], pad2_pos[1])]
+            pad2_pos = (pad2_inner[0], W + gap)
+            ret_center = [pad2_inner, (pad2_inner[0], pad2_pos[1])]
         else:                               # 接线在宽边（左边）→ 回线向左引出
-            pad2_pos = (-gap, inner_end[1])
-            ret_center = [inner_end, (pad2_pos[0], inner_end[1])]
+            pad2_pos = (-gap, pad2_inner[1])
+            ret_center = [pad2_inner, (pad2_pos[0], pad2_inner[1])]
         trace_len += polyline_length(ret_center)
-        ret_poly = ribbon_polygon(ret_center, max(cW, p.via_drill + 0.2))
-        vias = [inner_end, pad2_pos]
+        ret_poly = ribbon_polygon(ret_center, max(cW, p.via_size))
+        # 过孔放在线圈内端子处（外侧焊盘本身用通孔，兼作回线另一端的过孔）
+        vias = [via_inner]
+        via_sizes = [(p.via_size, p.via_size)]
         terminals["2"] = pad2_pos
+        # 外侧焊盘远离线圈，不受线距约束，用完整尺寸便于焊接
+        pad_sizes["2"] = (p.pad_size, p.pad_size)
+        pad_angles["2"] = 0.0
 
     est = estimate(p, trace_len)
 
@@ -479,16 +546,19 @@ def build(p: AntennaParams) -> AntennaGeometry:
     bx0, bx1 = min(xs), max(xs)
     by0, by1 = min(ys), max(ys)
 
-    silk = rect(-margin, -margin, L + margin, W + margin) if p.silk_margin >= 0 else []
-    fab = rect(-margin, -margin, L + margin, W + margin)
+    silk = (rect(bx0 - margin, by0 - margin, bx1 + margin, by1 + margin)
+            if p.silk_margin >= 0 else [])
+    fab = rect(bx0 - margin, by0 - margin, bx1 + margin, by1 + margin)
     cy = max(margin, 0.25) + 0.25
     courtyard = rect(bx0 - cy, by0 - cy, bx1 + cy, by1 + cy)
     ko = p.keepout_margin
     keepout = rect(bx0 - ko, by0 - ko, bx1 + ko, by1 + ko) if ko >= 0 else []
 
+    cx_mid = (bx0 + bx1) / 2.0
     return AntennaGeometry(
         params=p,
         coil_polygon=coil_poly,
+        centerline=centerline,
         terminals=terminals,
         return_polygon=ret_poly,
         return_centerline=ret_center,
@@ -497,8 +567,14 @@ def build(p: AntennaParams) -> AntennaGeometry:
         fab=fab,
         courtyard=courtyard,
         keepout=keepout,
-        ref_pos=(L / 2.0, -(margin + 1.8)),
-        value_pos=(L / 2.0, W + margin + 1.8),
+        pad_sizes=pad_sizes,
+        pad_angles=pad_angles,
+        via_sizes=via_sizes,
+        via_inner=via_inner,
+        coil_start=coil_start,
+        coil_end=coil_end,
+        ref_pos=(cx_mid, by0 - margin - 1.8),
+        value_pos=(cx_mid, by1 + margin + 1.8),
         estimate=est,
         back_corner_k=N * step - cS + margin,
     )

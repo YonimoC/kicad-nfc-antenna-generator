@@ -10,6 +10,7 @@ NFC Antenna Generator —— KiCad PCB 插件
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import sys
@@ -29,7 +30,7 @@ except Exception:  # noqa: BLE001 - 被当作顶层模块加载时
     import nfc_geometry as G  # type: ignore
 
 MM = pcbnew.FromMM
-PLUGIN_VERSION = "1.2.1"
+PLUGIN_VERSION = "1.2.2"
 
 SILK_W = 0.12
 FAB_W = 0.10
@@ -94,12 +95,24 @@ def _add_lines(fp, segs, layer, width: float) -> None:
         fp.Add(shp)
 
 
-def _add_pad(fp, number: str, x_mm: float, y_mm: float,
-             size_mm: float, drill_mm: float) -> None:
+def _add_pad(fp, number, x_mm, y_mm, sx_mm, sy_mm, drill_mm, rot_deg=0.0):
+    """接线焊盘 / 过孔。
+
+    用椭圆（长条）焊盘：沿走线方向窄（≤ 线宽），保证与相邻那一匝仍留出
+    conductor_space 的间距；沿法线方向长，保证可焊接面积。
+    """
     pad = pcbnew.PAD(fp)
     pad.SetNumber(number)
-    pad.SetShape(pcbnew.PAD_SHAPE_CIRCLE)
-    pad.SetSize(pcbnew.VECTOR2I(MM(size_mm), MM(size_mm)))
+    pad.SetShape(pcbnew.PAD_SHAPE_OVAL)
+    pad.SetSize(pcbnew.VECTOR2I(MM(sx_mm), MM(sy_mm)))
+    if rot_deg:
+        try:
+            pad.SetOrientationDegrees(rot_deg)
+        except Exception:  # noqa: BLE001
+            try:
+                pad.SetOrientation(pcbnew.EDA_ANGLE(rot_deg, pcbnew.DEGREES_T))
+            except Exception:  # noqa: BLE001
+                pass
 
     ls = pcbnew.LSET()
     if drill_mm > 0:
@@ -173,23 +186,27 @@ def build_footprint(geo: "G.AntennaGeometry", board=None) -> pcbnew.FOOTPRINT:
     # ---- 铜箔 ----
     _add_polygon(fp, geo.coil_polygon, pcbnew.F_Cu)
 
-    # ---- 接线焊盘 ----
-    pad_size = max(p.pad_size, p.conductor_width)
+    # ---- 接线焊盘 / 过孔 ----
+    pad_sizes = geo.pad_sizes or {}
+    pad_angles = geo.pad_angles or {}
     drill = p.pad_drill
     t1 = geo.terminals["1"]
-    _add_pad(fp, "1", t1[0], t1[1], pad_size, drill)
+    s1 = pad_sizes.get("1", (p.pad_size, p.pad_size))
+    _add_pad(fp, "1", t1[0], t1[1], s1[0], s1[1], drill, pad_angles.get("1", 0.0))
 
     t2 = geo.terminals["2"]
+    s2 = pad_sizes.get("2", (p.pad_size, p.pad_size))
     if p.terminal == "outer":
-        # 回线：B.Cu 自定义焊盘（带网络）+ 两个通孔焊盘充当过孔
-        ret_w = max(p.conductor_width, p.via_drill + 0.2)
+        # 外侧端子焊盘用通孔，兼作过孔（B.Cu 回线 ↔ F.Cu）
+        ret_w = max(p.conductor_width, p.via_size)
         if geo.return_polygon:
             _add_return_pad(fp, t2, geo.return_polygon, ret_w, "2")
-        via_size = max(p.via_drill + 0.4, 0.8)
+        _add_pad(fp, "2", t2[0], t2[1], s2[0], s2[1], max(p.via_drill, 0.2),
+                 pad_angles.get("2", 0.0))
         for (vx, vy) in geo.vias:
-            _add_pad(fp, "2", vx, vy, via_size, max(p.via_drill, 0.2))
+            _add_pad(fp, "2", vx, vy, p.via_size, p.via_size, p.via_drill)
     else:
-        _add_pad(fp, "2", t2[0], t2[1], pad_size, drill)
+        _add_pad(fp, "2", t2[0], t2[1], s2[0], s2[1], drill, pad_angles.get("2", 0.0))
 
     # ---- 注释线 ----
     _add_lines(fp, geo.silk, pcbnew.F_SilkS, SILK_W)
@@ -353,18 +370,27 @@ class PreviewPanel(wx.Panel):
                 dc.SetBrush(wx.Brush(colour))
                 dc.DrawPolygon([P(x, y) for (x, y) in poly])
 
-        # 焊盘
-        pr = max(geo.params.pad_size, geo.params.conductor_width) / 2 * scale
+        # 焊盘 / 过孔（按实际椭圆尺寸与角度绘制）
         dc.SetBrush(wx.TRANSPARENT_BRUSH)
         dc.SetPen(wx.Pen(wx.Colour(25, 211, 255), 2))
+
+        def rot_rect(cx, cy, sx, sy, rot):
+            ca, sa = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+            pts = []
+            for dx, dy in ((-sx / 2, -sy / 2), (sx / 2, -sy / 2),
+                           (sx / 2, sy / 2), (-sx / 2, sy / 2)):
+                pts.append(P(cx + dx * ca - dy * sa, cy + dx * sa + dy * ca))
+            return pts
+
         for name, (x, y) in geo.terminals.items():
-            p = P(x, y)
-            dc.DrawCircle(p, max(int(pr), 3))
-            dc.DrawText(name, wx.Point(p.x - 3, p.y - 6))
-        # 过孔
+            sx, sy = geo.pad_sizes.get(name, (geo.params.pad_size, geo.params.pad_size))
+            rot = geo.pad_angles.get(name, 0.0)
+            dc.DrawPolygon(rot_rect(x, y, sx, sy, rot))
+            dc.DrawText(name, wx.Point(P(x, y).x - 3, P(x, y).y - 6))
         dc.SetBrush(wx.Brush(wx.Colour(25, 211, 255)))
-        for (x, y) in geo.vias:
-            dc.DrawCircle(P(x, y), 3)
+        for i, (x, y) in enumerate(geo.vias):
+            s = geo.via_sizes[i][0] if i < len(geo.via_sizes) else geo.params.via_size
+            dc.DrawPolygon(rot_rect(x, y, s, s, 0.0))
 
 
 # ==========================================================================
@@ -392,6 +418,7 @@ class NfcAntennaDialog(wx.Dialog):
         self.cb_term = wx.Choice(self, choices=["内侧端子（单层，推荐标签）",
                                                 "外侧双焊盘（B.Cu 过孔跨接，推荐阅读器）"])
         self.cb_term.SetSelection(0)
+        self.sp_vsize = wx.SpinCtrlDouble(self, min=0.2, max=3, inc=0.05, initial=0.6)
         self.sp_via = wx.SpinCtrlDouble(self, min=0.1, max=2, inc=0.05, initial=0.3)
         self.sp_pdrill = wx.SpinCtrlDouble(self, min=0, max=5, inc=0.1, initial=0.0)
         self.sp_psize = wx.SpinCtrlDouble(self, min=0.4, max=10, inc=0.1, initial=1.2)
@@ -430,6 +457,7 @@ class NfcAntennaDialog(wx.Dialog):
         row("出线边", self.cb_edge)
         row("出线位置", self.cb_epos)
         row("端子方式", self.cb_term)
+        row("过孔外径 (mm)", self.sp_vsize)
         row("过孔钻径 (mm)", self.sp_via)
         row("焊盘钻径 (mm, 0=SMD)", self.sp_pdrill)
         row("焊盘直径 (mm)", self.sp_psize)
@@ -473,7 +501,7 @@ class NfcAntennaDialog(wx.Dialog):
 
     def _bind_events(self):
         for ctrl in (self.sp_turns, self.sp_len, self.sp_wid, self.sp_cw, self.sp_cs,
-                     self.sp_ch, self.sp_ko, self.sp_via, self.sp_pdrill,
+                     self.sp_ch, self.sp_ko, self.sp_vsize, self.sp_via, self.sp_pdrill,
                      self.sp_psize, self.sp_cu, self.sp_silk):
             ctrl.Bind(wx.EVT_SPINCTRLDOUBLE, lambda e: self._refresh())
             ctrl.Bind(wx.EVT_SPINCTRL, lambda e: self._refresh())
@@ -499,6 +527,7 @@ class NfcAntennaDialog(wx.Dialog):
             exit_edge="long" if self.cb_edge.GetSelection() == 0 else "short",
             exit_pos=["up", "mid", "down"][self.cb_epos.GetSelection()],
             terminal="outer" if self.cb_term.GetSelection() == 1 else "inner",
+            via_size=float(self.sp_vsize.GetValue()),
             via_drill=float(self.sp_via.GetValue()),
             pad_drill=float(self.sp_pdrill.GetValue()),
             pad_size=float(self.sp_psize.GetValue()),
@@ -537,7 +566,11 @@ class NfcAntennaDialog(wx.Dialog):
             f"{ {'up': '上端', 'mid': '中点', 'down': '下端'}[params.exit_pos] }",
             f"焊盘：1 @ ({geo.terminals['1'][0]:.2f}, {geo.terminals['1'][1]:.2f})   "
             f"2 @ ({geo.terminals['2'][0]:.2f}, {geo.terminals['2'][1]:.2f})",
+            f"尺寸：焊盘 {geo.pad_sizes['1'][0]:g}×{geo.pad_sizes['1'][1]:g} mm"
+            "（沿走线方向收窄到线宽，保证与相邻匝间距 = 线距）",
         ]
+        if geo.vias:
+            lines.append(f"过孔：Ø{params.via_size:g}/{params.via_drill:g} mm")
         warn = G.warnings(params, e)
         if warn:
             lines.append("")
